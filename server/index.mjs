@@ -268,6 +268,89 @@ const normalizeRemoteError = (message, label, statusCode) => {
   return `${label} 上游服务异常（${effectiveCode || statusCode}），返回了 HTML 错误页而不是模型结果。${briefText ? ` ${briefText.slice(0, 120)}${briefText.length > 120 ? '…' : ''}` : ''}`;
 };
 
+const parseJsonSafely = (value) => {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+};
+
+const parseSseBlock = (block) => {
+  const lines = block.split(/\r?\n/);
+  const dataLines = [];
+  let event = 'message';
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+
+    if (!line || line.startsWith(':')) {
+      continue;
+    }
+
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim() || 'message';
+      continue;
+    }
+
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+
+  if (!dataLines.length) {
+    return null;
+  }
+
+  return {
+    event,
+    data: dataLines.join('\n').trim(),
+  };
+};
+
+const readSseStream = async (response, onEvent) => {
+  if (!response.body) {
+    throw createHttpError('上游服务没有返回可读取的数据流。', 502);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const consumeBlock = async (block) => {
+    const parsedBlock = parseSseBlock(block);
+
+    if (parsedBlock) {
+      await onEvent(parsedBlock);
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+
+    const blocks = buffer.split(/\r?\n\r?\n/);
+    buffer = blocks.pop() ?? '';
+
+    for (const block of blocks) {
+      await consumeBlock(block);
+    }
+
+    if (done) {
+      break;
+    }
+  }
+
+  if (buffer.trim()) {
+    await consumeBlock(buffer);
+  }
+};
+
+const writeSseEvent = (response, event, data) => {
+  response.write(`event: ${event}\n`);
+  response.write(`data: ${JSON.stringify(data)}\n\n`);
+};
+
 const extractOpenAICompatibleDelta = (choice) => {
   const deltaContent = choice?.delta?.content;
 
@@ -282,37 +365,17 @@ const extractOpenAICompatibleDelta = (choice) => {
   return extractText(choice?.message?.content);
 };
 
-const readOpenAICompatibleStream = async (response, label) => {
-  if (!response.body) {
-    throw createHttpError(`${label} 没有返回可读取的数据流。`, 502);
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+const readOpenAICompatibleStream = async (response, label, onToken) => {
   let content = '';
 
-  const consumeEventBlock = (block) => {
-    const dataLines = block
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice(5).trimStart());
-
-    if (!dataLines.length) {
-      return;
-    }
-
-    const payloadText = dataLines.join('\n').trim();
-
+  await readSseStream(response, async ({ data: payloadText }) => {
     if (!payloadText || payloadText === '[DONE]') {
       return;
     }
 
-    let payload;
+    const payload = parseJsonSafely(payloadText);
 
-    try {
-      payload = JSON.parse(payloadText);
-    } catch {
+    if (!payload) {
       return;
     }
 
@@ -324,28 +387,93 @@ const readOpenAICompatibleStream = async (response, label) => {
 
     if (deltaText) {
       content += deltaText;
+      onToken?.(deltaText);
     }
-  };
+  });
 
-  while (true) {
-    const { value, done } = await reader.read();
-    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+  const finalContent = content.trim();
 
-    const blocks = buffer.split(/\r?\n\r?\n/);
-    buffer = blocks.pop() ?? '';
-
-    for (const block of blocks) {
-      consumeEventBlock(block);
-    }
-
-    if (done) {
-      break;
-    }
+  if (!finalContent) {
+    throw createHttpError(`${label} 没有返回文本内容。`, 502);
   }
 
-  if (buffer.trim()) {
-    consumeEventBlock(buffer);
+  return finalContent;
+};
+
+const readAnthropicStream = async (response, label, onToken) => {
+  let content = '';
+
+  await readSseStream(response, async ({ data }) => {
+    if (!data) {
+      return;
+    }
+
+    const payload = parseJsonSafely(data);
+
+    if (!payload) {
+      return;
+    }
+
+    if (payload?.type === 'error') {
+      throw createHttpError(readRemoteError(payload), 502);
+    }
+
+    const deltaText =
+      payload?.type === 'content_block_delta' && payload?.delta?.type === 'text_delta'
+        ? payload.delta.text
+        : '';
+
+    if (typeof deltaText === 'string' && deltaText) {
+      content += deltaText;
+      onToken?.(deltaText);
+    }
+  });
+
+  const finalContent = content.trim();
+
+  if (!finalContent) {
+    throw createHttpError(`${label} 没有返回文本内容。`, 502);
   }
+
+  return finalContent;
+};
+
+const readGeminiStream = async (response, label, onToken) => {
+  let content = '';
+
+  await readSseStream(response, async ({ data }) => {
+    if (!data) {
+      return;
+    }
+
+    const payload = parseJsonSafely(data);
+
+    if (!payload) {
+      return;
+    }
+
+    if (payload?.error) {
+      throw createHttpError(readRemoteError(payload), 502);
+    }
+
+    const deltaText = Array.isArray(payload?.candidates)
+      ? payload.candidates
+          .map((candidate) =>
+            Array.isArray(candidate?.content?.parts)
+              ? candidate.content.parts
+                  .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+                  .filter(Boolean)
+                  .join('\n')
+              : '',
+          )
+          .find(Boolean) ?? ''
+      : '';
+
+    if (deltaText) {
+      content += deltaText;
+      onToken?.(deltaText);
+    }
+  });
 
   const finalContent = content.trim();
 
@@ -397,14 +525,16 @@ const ensureSuccess = (response, data, label) => {
   throw createHttpError(detail, normalizeErrorStatus(response.status));
 };
 
-const requestOpenAICompatible = async (providerConfig, payload) => {
+const requestOpenAICompatible = async (providerConfig, payload, options = {}) => {
   const endpoint = `${providerConfig.baseUrl.replace(/\/$/, '')}/chat/completions`;
+  const shouldStream = Boolean(options.onToken);
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${providerConfig.apiKey}`,
       'Content-Type': 'application/json',
     },
+    signal: options.signal,
     body: JSON.stringify({
       model: payload.model,
       messages: payload.systemPrompt
@@ -412,14 +542,14 @@ const requestOpenAICompatible = async (providerConfig, payload) => {
         : payload.messages,
       temperature: payload.temperature,
       max_tokens: payload.maxTokens,
-      stream: true,
+      stream: shouldStream,
     }),
   });
 
   const contentType = response.headers.get('content-type') || '';
 
-  if (response.ok && contentType.includes('text/event-stream')) {
-    return readOpenAICompatibleStream(response, providerConfig.label);
+  if (response.ok && shouldStream && contentType.includes('text/event-stream')) {
+    return readOpenAICompatibleStream(response, providerConfig.label, options.onToken);
   }
 
   const data = await parseJsonResponse(response);
@@ -434,7 +564,8 @@ const requestOpenAICompatible = async (providerConfig, payload) => {
   return content;
 };
 
-const requestAnthropic = async (providerConfig, payload) => {
+const requestAnthropic = async (providerConfig, payload, options = {}) => {
+  const shouldStream = Boolean(options.onToken);
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -442,6 +573,7 @@ const requestAnthropic = async (providerConfig, payload) => {
       'x-api-key': providerConfig.apiKey,
       'anthropic-version': '2023-06-01',
     },
+    signal: options.signal,
     body: JSON.stringify({
       model: payload.model,
       system: payload.systemPrompt || undefined,
@@ -451,8 +583,15 @@ const requestAnthropic = async (providerConfig, payload) => {
       })),
       temperature: payload.temperature,
       max_tokens: payload.maxTokens,
+      stream: shouldStream,
     }),
   });
+
+  const contentType = response.headers.get('content-type') || '';
+
+  if (response.ok && shouldStream && contentType.includes('text/event-stream')) {
+    return readAnthropicStream(response, providerConfig.label, options.onToken);
+  }
 
   const data = await parseJsonResponse(response);
   ensureSuccess(response, data, providerConfig.label);
@@ -472,14 +611,18 @@ const requestAnthropic = async (providerConfig, payload) => {
   return content;
 };
 
-const requestGemini = async (providerConfig, payload) => {
-  const endpoint = `${providerConfig.baseUrl.replace(/\/$/, '')}/models/${payload.model}:generateContent`;
+const requestGemini = async (providerConfig, payload, options = {}) => {
+  const shouldStream = Boolean(options.onToken);
+  const endpoint = shouldStream
+    ? `${providerConfig.baseUrl.replace(/\/$/, '')}/models/${payload.model}:streamGenerateContent?alt=sse`
+    : `${providerConfig.baseUrl.replace(/\/$/, '')}/models/${payload.model}:generateContent`;
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'x-goog-api-key': providerConfig.apiKey,
     },
+    signal: options.signal,
     body: JSON.stringify({
       systemInstruction: payload.systemPrompt
         ? {
@@ -498,6 +641,12 @@ const requestGemini = async (providerConfig, payload) => {
       },
     }),
   });
+
+  const contentType = response.headers.get('content-type') || '';
+
+  if (response.ok && shouldStream && contentType.includes('text/event-stream')) {
+    return readGeminiStream(response, providerConfig.label, options.onToken);
+  }
 
   const data = await parseJsonResponse(response);
   ensureSuccess(response, data, providerConfig.label);
@@ -528,21 +677,21 @@ const requestGemini = async (providerConfig, payload) => {
   return content;
 };
 
-const routeChat = async (providerConfig, payload) => {
+const routeChat = async (providerConfig, payload, options = {}) => {
   if (!providerConfig.configured || !providerConfig.apiKey) {
     throw new Error(`${providerConfig.label} 尚未配置，请先填写对应 API Key。`);
   }
 
   if (providerConfig.type === 'openai-compatible') {
-    return requestOpenAICompatible(providerConfig, payload);
+    return requestOpenAICompatible(providerConfig, payload, options);
   }
 
   if (providerConfig.type === 'anthropic') {
-    return requestAnthropic(providerConfig, payload);
+    return requestAnthropic(providerConfig, payload, options);
   }
 
   if (providerConfig.type === 'gemini') {
-    return requestGemini(providerConfig, payload);
+    return requestGemini(providerConfig, payload, options);
   }
 
   throw new Error(`暂不支持 ${providerConfig.label} 的请求方式。`);
@@ -573,6 +722,94 @@ app.post('/api/chat', async (request, response) => {
         content,
       },
     });
+  } catch (error) {
+    response.status(error?.statusCode || 400).json({
+      error: error instanceof Error ? error.message : '调用模型服务失败。',
+    });
+  }
+});
+
+app.post('/api/chat/stream', async (request, response) => {
+  try {
+    const payload = parsePayload(request.body);
+    const providerConfig = readProviders().find(
+      (provider) => provider.key === payload.provider,
+    );
+
+    if (!providerConfig) {
+      throw new Error('未找到对应的模型服务。');
+    }
+
+    const messageId = crypto.randomUUID();
+    const abortController = new AbortController();
+    let clientClosed = false;
+    let fullContent = '';
+
+    response.on('close', () => {
+      clientClosed = true;
+      abortController.abort();
+    });
+
+    response.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+
+    if (typeof response.flushHeaders === 'function') {
+      response.flushHeaders();
+    }
+
+    writeSseEvent(response, 'start', { messageId });
+
+    try {
+      const content = await routeChat(providerConfig, payload, {
+        signal: abortController.signal,
+        onToken: (delta) => {
+          if (!delta || clientClosed) {
+            return;
+          }
+
+          fullContent += delta;
+          writeSseEvent(response, 'delta', {
+            messageId,
+            delta,
+          });
+        },
+      });
+
+      if (clientClosed) {
+        return;
+      }
+
+      if (!fullContent && content) {
+        fullContent = content;
+        writeSseEvent(response, 'delta', {
+          messageId,
+          delta: content,
+        });
+      }
+
+      writeSseEvent(response, 'done', {
+        message: {
+          id: messageId,
+          content: fullContent || content,
+        },
+      });
+    } catch (error) {
+      if (clientClosed) {
+        return;
+      }
+
+      writeSseEvent(response, 'error', {
+        error: error instanceof Error ? error.message : '调用模型服务失败。',
+      });
+    } finally {
+      if (!clientClosed) {
+        response.end();
+      }
+    }
   } catch (error) {
     response.status(error?.statusCode || 400).json({
       error: error instanceof Error ? error.message : '调用模型服务失败。',

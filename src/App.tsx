@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import MarkdownMessage from './components/MarkdownMessage';
 import {
   createConversation,
   createId,
@@ -12,17 +13,30 @@ import {
   SUGGESTION_PROMPTS,
   truncateTitle,
 } from './chat';
+import { parseStreamData, readErrorResponse, readSseResponse } from './stream';
 import type { ChatMessage, Conversation, ProviderInfo } from './types';
 
 interface ProvidersResponse {
   providers: ProviderInfo[];
 }
 
-interface ChatResponse {
+interface ChatStreamStartEvent {
+  messageId?: string;
+}
+
+interface ChatStreamDeltaEvent {
+  messageId?: string;
+  delta?: string;
+}
+
+interface ChatStreamDoneEvent {
   message?: {
     id?: string;
     content?: string;
   };
+}
+
+interface ChatStreamErrorEvent {
   error?: string;
 }
 
@@ -36,6 +50,7 @@ const App = () => {
   const [composer, setComposer] = useState('');
   const [isBooting, setIsBooting] = useState(true);
   const [isSending, setIsSending] = useState(false);
+  const [streamingMessageId, setStreamingMessageId] = useState('');
   const [bootError, setBootError] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const listEndRef = useRef<HTMLDivElement | null>(null);
@@ -117,6 +132,20 @@ const App = () => {
         ),
       ),
     );
+  };
+
+  const patchConversationMessage = (
+    conversationId: string,
+    messageId: string,
+    updater: (message: ChatMessage) => ChatMessage,
+  ) => {
+    patchConversation(conversationId, (conversation) => ({
+      ...conversation,
+      messages: conversation.messages.map((message) =>
+        message.id === messageId ? updater(message) : message,
+      ),
+      updatedAt: now(),
+    }));
   };
 
   const handleCreateConversation = () => {
@@ -222,14 +251,29 @@ const App = () => {
       updatedAt: now(),
     };
 
-    patchConversation(activeConversation.id, () => requestConversation);
+    const assistantMessageId = createId();
+    const assistantMessage: ChatMessage = {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '',
+      createdAt: now(),
+      provider: requestConversation.provider,
+      model: requestConversation.model,
+    };
+
+    patchConversation(activeConversation.id, () => ({
+      ...requestConversation,
+      messages: [...requestConversation.messages, assistantMessage],
+    }));
     setComposer('');
     setIsSending(true);
+    setStreamingMessageId(assistantMessageId);
 
     try {
-      const response = await fetch('/api/chat', {
+      const response = await fetch('/api/chat/stream', {
         method: 'POST',
         headers: {
+          Accept: 'text/event-stream',
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
@@ -245,44 +289,84 @@ const App = () => {
         }),
       });
 
-      const data = (await response.json().catch(() => null)) as ChatResponse | null;
-
       if (!response.ok) {
-        throw new Error(data?.error ?? '模型服务调用失败。');
+        throw new Error(await readErrorResponse(response));
       }
 
-      const assistantMessage: ChatMessage = {
-        id: data?.message?.id ?? createId(),
-        role: 'assistant',
-        content: data?.message?.content?.trim() || '模型没有返回可显示的内容。',
-        createdAt: now(),
-        provider: requestConversation.provider,
-        model: requestConversation.model,
-      };
+      let streamedContent = '';
 
-      patchConversation(requestConversation.id, (conversation) => ({
-        ...conversation,
-        messages: [...conversation.messages, assistantMessage],
-        updatedAt: now(),
-      }));
+      await readSseResponse(response, async ({ event, data }) => {
+        if (event === 'start') {
+          parseStreamData<ChatStreamStartEvent>(data);
+          return;
+        }
+
+        if (event === 'delta') {
+          const payload = parseStreamData<ChatStreamDeltaEvent>(data);
+          const delta = typeof payload?.delta === 'string' ? payload.delta : '';
+
+          if (!delta) {
+            return;
+          }
+
+          streamedContent += delta;
+          patchConversationMessage(
+            requestConversation.id,
+            assistantMessageId,
+            (message) => ({
+              ...message,
+              content: streamedContent,
+            }),
+          );
+          return;
+        }
+
+        if (event === 'done') {
+          const payload = parseStreamData<ChatStreamDoneEvent>(data);
+          const finalContent =
+            typeof payload?.message?.content === 'string' ? payload.message.content : '';
+
+          if (finalContent && finalContent !== streamedContent) {
+            streamedContent = finalContent;
+            patchConversationMessage(
+              requestConversation.id,
+              assistantMessageId,
+              (message) => ({
+                ...message,
+                content: finalContent,
+              }),
+            );
+          }
+          return;
+        }
+
+        if (event === 'error') {
+          const payload = parseStreamData<ChatStreamErrorEvent>(data);
+          throw new Error(payload?.error ?? '模型服务调用失败。');
+        }
+      });
+
+      if (!streamedContent) {
+        patchConversationMessage(
+          requestConversation.id,
+          assistantMessageId,
+          (message) => ({
+            ...message,
+            content: '模型没有返回可显示的内容。',
+          }),
+        );
+      }
     } catch (error) {
-      const assistantMessage: ChatMessage = {
-        id: createId(),
-        role: 'assistant',
+      patchConversationMessage(requestConversation.id, assistantMessageId, (message) => ({
+        ...message,
         content: `请求失败：${getErrorMessage(error)}`,
-        createdAt: now(),
         error: true,
-        provider: requestConversation.provider,
-        model: requestConversation.model,
-      };
-
-      patchConversation(requestConversation.id, (conversation) => ({
-        ...conversation,
-        messages: [...conversation.messages, assistantMessage],
-        updatedAt: now(),
       }));
     } finally {
       setIsSending(false);
+      setStreamingMessageId((current) =>
+        current === assistantMessageId ? '' : current,
+      );
     }
   };
 
@@ -545,31 +629,25 @@ const App = () => {
                       <span>
                         {message.role === 'assistant'
                           ? message.model ?? activeConversation.model
-                          : '发送中'}
+                          : '已发送'}
                       </span>
                       <time>{formatClock(message.createdAt)}</time>
                     </div>
-                    <div className="message-content">{message.content}</div>
+                    <div className="message-content">
+                      {message.id === streamingMessageId && !message.content && !message.error ? (
+                        <div className="typing-indicator" aria-label="正在思考">
+                          <span />
+                          <span />
+                          <span />
+                        </div>
+                      ) : (
+                        <MarkdownMessage content={message.content} />
+                      )}
+                    </div>
                   </div>
                 </article>
               );
             })}
-
-            {isSending && (
-              <article className="message-row message-row--assistant">
-                <div className="message-card message-card--assistant">
-                  <div className="message-meta">
-                    <strong>{activeProvider?.label ?? 'AI'}</strong>
-                    <span>{activeConversation.model || '未选择模型'}</span>
-                  </div>
-                  <div className="typing-indicator" aria-label="正在思考">
-                    <span />
-                    <span />
-                    <span />
-                  </div>
-                </div>
-              </article>
-            )}
             <div ref={listEndRef} />
           </div>
         </section>
@@ -626,4 +704,3 @@ const App = () => {
 };
 
 export default App;
-

@@ -436,8 +436,94 @@ code {
 
 .message-content {
   color: #f7fbff;
-  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.markdown-body {
+  color: inherit;
+}
+
+.markdown-body > :first-child {
+  margin-top: 0;
+}
+
+.markdown-body > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body pre,
+.markdown-body blockquote,
+.markdown-body table,
+.markdown-body hr {
+  margin: 0 0 0.9rem;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  padding-left: 1.3rem;
+}
+
+.markdown-body li + li {
+  margin-top: 0.25rem;
+}
+
+.markdown-body a {
+  color: #7dddc7;
+}
+
+.markdown-body blockquote {
+  border-left: 3px solid rgba(125, 221, 199, 0.45);
+  color: #c6d4de;
+  margin-left: 0;
+  padding-left: 1rem;
+}
+
+.markdown-body code {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  font-family: 'SFMono-Regular', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.92em;
+  padding: 0.12rem 0.4rem;
+}
+
+.markdown-pre {
+  background: rgba(10, 12, 14, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 16px;
+  overflow-x: auto;
+  padding: 14px 16px;
+}
+
+.markdown-pre code {
+  background: transparent;
+  border: 0;
+  display: block;
+  padding: 0;
+}
+
+.markdown-table-wrapper {
+  overflow-x: auto;
+}
+
+.markdown-table-wrapper table {
+  border-collapse: collapse;
+  min-width: 100%;
+}
+
+.markdown-table-wrapper th,
+.markdown-table-wrapper td {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 10px 12px;
+  text-align: left;
+}
+
+.markdown-table-wrapper thead {
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .typing-indicator {
@@ -593,4 +679,3 @@ code {
     flex: 1;
   }
 }
-
