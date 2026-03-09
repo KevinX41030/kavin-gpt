@@ -218,6 +218,144 @@ const parseJsonResponse = async (response) => {
   }
 };
 
+const createHttpError = (message, statusCode = 400) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+};
+
+const stripHtml = (value) =>
+  value
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;|&#38;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const isHtmlDocument = (value) =>
+  typeof value === 'string' && /<(?:!doctype|html|head|body)\b/i.test(value);
+
+const normalizeErrorStatus = (statusCode) => {
+  if (statusCode === 524) {
+    return 504;
+  }
+
+  return statusCode >= 400 && statusCode < 600 ? statusCode : 502;
+};
+
+const normalizeRemoteError = (message, label, statusCode) => {
+  if (!message) {
+    return `${label} 请求失败（${statusCode}）。`;
+  }
+
+  if (!isHtmlDocument(message)) {
+    return message;
+  }
+
+  const htmlText = stripHtml(message);
+  const cloudflareCode = message.match(/Error code\s*(\d{3})/i)?.[1];
+  const effectiveCode = cloudflareCode ? Number(cloudflareCode) : statusCode;
+
+  if (effectiveCode === 524) {
+    return `${label} 上游服务超时（Cloudflare 524）。这通常是长文本或长输出让模型网关处理过久导致的。建议降低 Max tokens、拆分长文本，或改用更稳定的直连服务。`;
+  }
+
+  const briefText = htmlText.replace(/\s+/g, ' ').trim();
+  return `${label} 上游服务异常（${effectiveCode || statusCode}），返回了 HTML 错误页而不是模型结果。${briefText ? ` ${briefText.slice(0, 120)}${briefText.length > 120 ? '…' : ''}` : ''}`;
+};
+
+const extractOpenAICompatibleDelta = (choice) => {
+  const deltaContent = choice?.delta?.content;
+
+  if (typeof deltaContent === 'string') {
+    return deltaContent;
+  }
+
+  if (Array.isArray(deltaContent)) {
+    return extractText(deltaContent);
+  }
+
+  return extractText(choice?.message?.content);
+};
+
+const readOpenAICompatibleStream = async (response, label) => {
+  if (!response.body) {
+    throw createHttpError(`${label} 没有返回可读取的数据流。`, 502);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+
+  const consumeEventBlock = (block) => {
+    const dataLines = block
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trimStart());
+
+    if (!dataLines.length) {
+      return;
+    }
+
+    const payloadText = dataLines.join('\n').trim();
+
+    if (!payloadText || payloadText === '[DONE]') {
+      return;
+    }
+
+    let payload;
+
+    try {
+      payload = JSON.parse(payloadText);
+    } catch {
+      return;
+    }
+
+    if (payload?.error) {
+      throw createHttpError(readRemoteError(payload), 502);
+    }
+
+    const deltaText = extractOpenAICompatibleDelta(payload?.choices?.[0]);
+
+    if (deltaText) {
+      content += deltaText;
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+
+    const blocks = buffer.split(/\r?\n\r?\n/);
+    buffer = blocks.pop() ?? '';
+
+    for (const block of blocks) {
+      consumeEventBlock(block);
+    }
+
+    if (done) {
+      break;
+    }
+  }
+
+  if (buffer.trim()) {
+    consumeEventBlock(buffer);
+  }
+
+  const finalContent = content.trim();
+
+  if (!finalContent) {
+    throw createHttpError(`${label} 没有返回文本内容。`, 502);
+  }
+
+  return finalContent;
+};
+
 const readRemoteError = (data) => {
   if (!data) {
     return '';
@@ -251,8 +389,12 @@ const ensureSuccess = (response, data, label) => {
     return;
   }
 
-  const detail = readRemoteError(data) || `${label} 请求失败（${response.status}）`;
-  throw new Error(detail);
+  const detail = normalizeRemoteError(
+    readRemoteError(data),
+    label,
+    response.status,
+  );
+  throw createHttpError(detail, normalizeErrorStatus(response.status));
 };
 
 const requestOpenAICompatible = async (providerConfig, payload) => {
@@ -270,9 +412,15 @@ const requestOpenAICompatible = async (providerConfig, payload) => {
         : payload.messages,
       temperature: payload.temperature,
       max_tokens: payload.maxTokens,
-      stream: false,
+      stream: true,
     }),
   });
+
+  const contentType = response.headers.get('content-type') || '';
+
+  if (response.ok && contentType.includes('text/event-stream')) {
+    return readOpenAICompatibleStream(response, providerConfig.label);
+  }
 
   const data = await parseJsonResponse(response);
   ensureSuccess(response, data, providerConfig.label);
@@ -426,7 +574,7 @@ app.post('/api/chat', async (request, response) => {
       },
     });
   } catch (error) {
-    response.status(400).json({
+    response.status(error?.statusCode || 400).json({
       error: error instanceof Error ? error.message : '调用模型服务失败。',
     });
   }
@@ -448,4 +596,3 @@ if (fs.existsSync(distDir)) {
 app.listen(port, () => {
   console.log(`Kavin GPT server listening on http://localhost:${port}`);
 });
-
