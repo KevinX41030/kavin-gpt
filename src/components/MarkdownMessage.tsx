@@ -25,18 +25,19 @@ const MarkdownTable = (props: ComponentPropsWithoutRef<'table'>) => (
 );
 
 const MarkdownMessage = ({ content }: MarkdownMessageProps) => (
-  <ReactMarkdown
-    className="markdown-body"
-    components={{
-      a: MarkdownLink,
-      code: MarkdownCode,
-      pre: MarkdownPre,
-      table: MarkdownTable,
-    }}
-    remarkPlugins={[remarkGfm]}
-  >
-    {content}
-  </ReactMarkdown>
+  <div className="markdown-body">
+    <ReactMarkdown
+      components={{
+        a: MarkdownLink,
+        code: MarkdownCode,
+        pre: MarkdownPre,
+        table: MarkdownTable,
+      }}
+      remarkPlugins={[remarkGfm]}
+    >
+      {content}
+    </ReactMarkdown>
+  </div>
 );
 
 export default MarkdownMessage;
