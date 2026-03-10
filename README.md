@@ -49,6 +49,7 @@ npm run start
 ```
 
 默认后端端口是 `3001`，可通过 `PORT` 修改。
+图片上传请求体上限默认是 `100mb`，可通过 `REQUEST_BODY_LIMIT` 调整。
 
 ## 环境变量
 

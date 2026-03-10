@@ -10,11 +10,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
 const distDir = path.join(rootDir, 'dist');
 const port = Number(process.env.PORT || 3001);
+const requestBodyLimit = process.env.REQUEST_BODY_LIMIT || '100mb';
 const IMAGE_DATA_URL_PATTERN = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=]+)$/i;
 
 const app = express();
 
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({ limit: requestBodyLimit }));
 
 const splitModels = (value, fallback = []) => {
   const items = typeof value === 'string'

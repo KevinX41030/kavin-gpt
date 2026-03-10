@@ -22,7 +22,6 @@ import type {
 } from './types';
 
 const MAX_IMAGE_COUNT = 4;
-const MAX_IMAGE_SIZE_BYTES = 3 * 1024 * 1024;
 
 const readFileAsDataUrl = (file: File) =>
   new Promise<string>((resolve, reject) => {
@@ -200,16 +199,10 @@ const App = () => {
       return;
     }
 
-    const invalidFile = incomingFiles.find(
-      (file) => !file.type.startsWith('image/') || file.size > MAX_IMAGE_SIZE_BYTES,
-    );
+    const invalidFile = incomingFiles.find((file) => !file.type.startsWith('image/'));
 
     if (invalidFile) {
-      setComposerError(
-        invalidFile.type.startsWith('image/')
-          ? `单张图片不能超过 ${formatFileSize(MAX_IMAGE_SIZE_BYTES)}。`
-          : '只能上传图片文件。',
-      );
+      setComposerError('只能上传图片文件。');
       return;
     }
 
