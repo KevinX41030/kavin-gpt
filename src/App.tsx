@@ -3,6 +3,7 @@ import MarkdownMessage from './components/MarkdownMessage';
 import {
   createConversation,
   createId,
+  deriveConversationTitle,
   formatClock,
   getProviderByKey,
   loadStoredConversations,
@@ -11,10 +12,45 @@ import {
   saveStoredConversations,
   sortConversations,
   SUGGESTION_PROMPTS,
-  truncateTitle,
 } from './chat';
 import { parseStreamData, readErrorResponse, readSseResponse } from './stream';
-import type { ChatMessage, Conversation, ProviderInfo } from './types';
+import type {
+  ChatAttachment,
+  ChatMessage,
+  Conversation,
+  ProviderInfo,
+} from './types';
+
+const MAX_IMAGE_COUNT = 4;
+const MAX_IMAGE_SIZE_BYTES = 3 * 1024 * 1024;
+
+const readFileAsDataUrl = (file: File) =>
+  new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result);
+        return;
+      }
+
+      reject(new Error(`无法读取文件：${file.name}`));
+    };
+
+    reader.onerror = () => {
+      reject(new Error(`无法读取文件：${file.name}`));
+    };
+
+    reader.readAsDataURL(file);
+  });
+
+const formatFileSize = (value: number) => {
+  if (value < 1024 * 1024) {
+    return `${Math.max(1, Math.round(value / 1024))} KB`;
+  }
+
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+};
 
 interface ProvidersResponse {
   providers: ProviderInfo[];
@@ -48,12 +84,15 @@ const App = () => {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState('');
   const [composer, setComposer] = useState('');
+  const [composerAttachments, setComposerAttachments] = useState<ChatAttachment[]>([]);
+  const [composerError, setComposerError] = useState('');
   const [isBooting, setIsBooting] = useState(true);
   const [isSending, setIsSending] = useState(false);
   const [streamingMessageId, setStreamingMessageId] = useState('');
   const [bootError, setBootError] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const listEndRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const activeConversation = useMemo(
     () => conversations.find((item) => item.id === activeConversationId) ?? null,
@@ -71,7 +110,7 @@ const App = () => {
   );
 
   const canSend = Boolean(
-    composer.trim() &&
+    (composer.trim() || composerAttachments.length) &&
       activeConversation?.provider &&
       activeConversation?.model &&
       activeProvider?.configured &&
@@ -146,6 +185,63 @@ const App = () => {
       ),
       updatedAt: now(),
     }));
+  };
+
+  const handlePickImages = async (files: FileList | null) => {
+    if (!files?.length) {
+      return;
+    }
+
+    const existingCount = composerAttachments.length;
+    const incomingFiles = Array.from(files);
+
+    if (existingCount + incomingFiles.length > MAX_IMAGE_COUNT) {
+      setComposerError(`最多上传 ${MAX_IMAGE_COUNT} 张图片。`);
+      return;
+    }
+
+    const invalidFile = incomingFiles.find(
+      (file) => !file.type.startsWith('image/') || file.size > MAX_IMAGE_SIZE_BYTES,
+    );
+
+    if (invalidFile) {
+      setComposerError(
+        invalidFile.type.startsWith('image/')
+          ? `单张图片不能超过 ${formatFileSize(MAX_IMAGE_SIZE_BYTES)}。`
+          : '只能上传图片文件。',
+      );
+      return;
+    }
+
+    try {
+      const nextAttachments = await Promise.all(
+        incomingFiles.map(async (file) => ({
+          id: createId(),
+          type: 'image' as const,
+          name: file.name,
+          mimeType: file.type,
+          size: file.size,
+          dataUrl: await readFileAsDataUrl(file),
+        })),
+      );
+
+      setComposerAttachments((current) => [...current, ...nextAttachments]);
+      setComposerError('');
+    } catch (error) {
+      setComposerError(getErrorMessage(error));
+    }
+  };
+
+  const handleRemoveComposerAttachment = (attachmentId: string) => {
+    setComposerAttachments((current) =>
+      current.filter((attachment) => attachment.id !== attachmentId),
+    );
+  };
+
+  const handleClearComposer = () => {
+    setComposer('');
+    setComposerAttachments([]);
+    setComposerError('');
   };
 
   const handleCreateConversation = () => {
@@ -228,7 +324,7 @@ const App = () => {
 
     const content = (seed ?? composer).trim();
 
-    if (!content || !activeProvider?.configured || isSending) {
+    if ((!content && !composerAttachments.length) || !activeProvider?.configured || isSending) {
       return;
     }
 
@@ -236,6 +332,7 @@ const App = () => {
       id: createId(),
       role: 'user',
       content,
+      attachments: composerAttachments,
       createdAt: now(),
       provider: activeConversation.provider,
       model: activeConversation.model,
@@ -245,7 +342,7 @@ const App = () => {
       ...activeConversation,
       title:
         activeConversation.messages.length === 0
-          ? truncateTitle(content)
+          ? deriveConversationTitle(userMessage)
           : activeConversation.title,
       messages: [...activeConversation.messages, userMessage],
       updatedAt: now(),
@@ -266,6 +363,8 @@ const App = () => {
       messages: [...requestConversation.messages, assistantMessage],
     }));
     setComposer('');
+    setComposerAttachments([]);
+    setComposerError('');
     setIsSending(true);
     setStreamingMessageId(assistantMessageId);
 
@@ -285,6 +384,7 @@ const App = () => {
           messages: requestConversation.messages.map((message) => ({
             role: message.role,
             content: message.content,
+            attachments: message.attachments,
           })),
         }),
       });
@@ -368,6 +468,51 @@ const App = () => {
         current === assistantMessageId ? '' : current,
       );
     }
+  };
+
+  const renderAttachmentGrid = (
+    attachments: ChatAttachment[] | undefined,
+    removable = false,
+  ) => {
+    if (!attachments?.length) {
+      return null;
+    }
+
+    return (
+      <div className="attachment-grid">
+        {attachments.map((attachment) => (
+          <div className="attachment-card" key={attachment.id}>
+            {attachment.dataUrl ? (
+              <img
+                alt={attachment.name}
+                className="attachment-image"
+                src={attachment.dataUrl}
+              />
+            ) : (
+              <div className="attachment-fallback">图片预览不可用</div>
+            )}
+
+            <div className="attachment-meta-row">
+              <div className="attachment-meta">
+                <strong>{attachment.name}</strong>
+                <span>{formatFileSize(attachment.size)}</span>
+              </div>
+
+              {removable && (
+                <button
+                  aria-label={`移除 ${attachment.name}`}
+                  className="attachment-remove-button"
+                  onClick={() => handleRemoveComposerAttachment(attachment.id)}
+                  type="button"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
   };
 
   if (isBooting || !activeConversation) {
@@ -634,6 +779,7 @@ const App = () => {
                       <time>{formatClock(message.createdAt)}</time>
                     </div>
                     <div className="message-content">
+                      {renderAttachmentGrid(message.attachments)}
                       {message.id === streamingMessageId && !message.content && !message.error ? (
                         <div className="typing-indicator" aria-label="正在思考">
                           <span />
@@ -660,6 +806,21 @@ const App = () => {
               void handleSend();
             }}
           >
+            <input
+              accept="image/*"
+              className="composer-file-input"
+              multiple
+              onChange={(event) => {
+                void handlePickImages(event.target.files);
+                event.target.value = '';
+              }}
+              ref={fileInputRef}
+              type="file"
+            />
+
+            {renderAttachmentGrid(composerAttachments, true)}
+            {composerError && <div className="composer-error">{composerError}</div>}
+
             <textarea
               className="composer-textarea"
               onChange={(event) => setComposer(event.target.value)}
@@ -688,7 +849,14 @@ const App = () => {
               </p>
 
               <div className="composer-actions">
-                <button className="ghost-button" onClick={() => setComposer('')} type="button">
+                <button
+                  className="ghost-button"
+                  onClick={() => fileInputRef.current?.click()}
+                  type="button"
+                >
+                  图片
+                </button>
+                <button className="ghost-button" onClick={handleClearComposer} type="button">
                   清空
                 </button>
                 <button className="send-button" disabled={!canSend} type="submit">

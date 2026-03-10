@@ -10,10 +10,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
 const distDir = path.join(rootDir, 'dist');
 const port = Number(process.env.PORT || 3001);
+const IMAGE_DATA_URL_PATTERN = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=]+)$/i;
 
 const app = express();
 
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '25mb' }));
 
 const splitModels = (value, fallback = []) => {
   const items = typeof value === 'string'
@@ -107,6 +108,49 @@ const readProviders = () => {
   return providers;
 };
 
+const sanitizeAttachments = (attachments) => {
+  if (!Array.isArray(attachments)) {
+    return [];
+  }
+
+  return attachments
+    .map((attachment) => {
+      const type = attachment?.type === 'image' ? attachment.type : null;
+      const name = typeof attachment?.name === 'string' ? attachment.name.trim() : 'image';
+      const mimeType =
+        typeof attachment?.mimeType === 'string' ? attachment.mimeType.trim() : '';
+      const dataUrl = typeof attachment?.dataUrl === 'string' ? attachment.dataUrl.trim() : '';
+      const size =
+        typeof attachment?.size === 'number' && Number.isFinite(attachment.size)
+          ? attachment.size
+          : 0;
+
+      if (!type || !mimeType || !dataUrl) {
+        return null;
+      }
+
+      const matches = dataUrl.match(IMAGE_DATA_URL_PATTERN);
+
+      if (!matches || matches[1] !== mimeType) {
+        return null;
+      }
+
+      return {
+        id:
+          typeof attachment?.id === 'string' && attachment.id
+            ? attachment.id
+            : crypto.randomUUID(),
+        type,
+        name,
+        mimeType,
+        size,
+        dataUrl,
+        base64Data: matches[2],
+      };
+    })
+    .filter(Boolean);
+};
+
 const sanitizeMessages = (messages) => {
   if (!Array.isArray(messages)) {
     return [];
@@ -119,12 +163,13 @@ const sanitizeMessages = (messages) => {
           ? message.role
           : null;
       const content = typeof message?.content === 'string' ? message.content.trim() : '';
+      const attachments = sanitizeAttachments(message?.attachments);
 
-      if (!role || !content) {
+      if (!role || (!content && !attachments.length)) {
         return null;
       }
 
-      return { role, content };
+      return { role, content, attachments };
     })
     .filter(Boolean);
 };
@@ -137,14 +182,84 @@ const mergeAdjacentMessages = (messages, roleMapper = (role) => role) => {
     const previous = merged[merged.length - 1];
 
     if (previous && previous.role === role) {
-      previous.content = `${previous.content}\n\n${message.content}`;
+      previous.content = [previous.content, message.content].filter(Boolean).join('\n\n');
+      previous.attachments = [...(previous.attachments || []), ...(message.attachments || [])];
       continue;
     }
 
-    merged.push({ role, content: message.content });
+    merged.push({
+      role,
+      content: message.content,
+      attachments: message.attachments || [],
+    });
   }
 
   return merged;
+};
+
+const buildOpenAICompatibleMessageContent = (message) => {
+  const attachments = message.attachments || [];
+
+  if (!attachments.length) {
+    return message.content;
+  }
+
+  const parts = [];
+
+  if (message.content) {
+    parts.push({ type: 'text', text: message.content });
+  }
+
+  for (const attachment of attachments) {
+    parts.push({
+      type: 'image_url',
+      image_url: {
+        url: attachment.dataUrl,
+      },
+    });
+  }
+
+  return parts;
+};
+
+const buildAnthropicMessageContent = (message) => {
+  const blocks = [];
+
+  if (message.content) {
+    blocks.push({ type: 'text', text: message.content });
+  }
+
+  for (const attachment of message.attachments || []) {
+    blocks.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: attachment.mimeType,
+        data: attachment.base64Data,
+      },
+    });
+  }
+
+  return blocks;
+};
+
+const buildGeminiMessageParts = (message) => {
+  const parts = [];
+
+  if (message.content) {
+    parts.push({ text: message.content });
+  }
+
+  for (const attachment of message.attachments || []) {
+    parts.push({
+      inlineData: {
+        mimeType: attachment.mimeType,
+        data: attachment.base64Data,
+      },
+    });
+  }
+
+  return parts;
 };
 
 const parsePayload = (body) => {
@@ -538,8 +653,17 @@ const requestOpenAICompatible = async (providerConfig, payload, options = {}) =>
     body: JSON.stringify({
       model: payload.model,
       messages: payload.systemPrompt
-        ? [{ role: 'system', content: payload.systemPrompt }, ...payload.messages]
-        : payload.messages,
+        ? [
+            { role: 'system', content: payload.systemPrompt },
+            ...payload.messages.map((message) => ({
+              role: message.role,
+              content: buildOpenAICompatibleMessageContent(message),
+            })),
+          ]
+        : payload.messages.map((message) => ({
+            role: message.role,
+            content: buildOpenAICompatibleMessageContent(message),
+          })),
       temperature: payload.temperature,
       max_tokens: payload.maxTokens,
       stream: shouldStream,
@@ -579,7 +703,7 @@ const requestAnthropic = async (providerConfig, payload, options = {}) => {
       system: payload.systemPrompt || undefined,
       messages: mergeAdjacentMessages(payload.messages).map((message) => ({
         role: message.role,
-        content: [{ type: 'text', text: message.content }],
+        content: buildAnthropicMessageContent(message),
       })),
       temperature: payload.temperature,
       max_tokens: payload.maxTokens,
@@ -633,7 +757,7 @@ const requestGemini = async (providerConfig, payload, options = {}) => {
         role === 'assistant' ? 'model' : 'user',
       ).map((message) => ({
         role: message.role,
-        parts: [{ text: message.content }],
+        parts: buildGeminiMessageParts(message),
       })),
       generationConfig: {
         temperature: payload.temperature,

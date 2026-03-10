@@ -445,6 +445,78 @@ code {
   word-break: break-word;
 }
 
+.attachment-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 220px));
+  margin-bottom: 12px;
+}
+
+.attachment-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  overflow: hidden;
+}
+
+.attachment-image,
+.attachment-fallback {
+  aspect-ratio: 1.3;
+  display: block;
+  width: 100%;
+}
+
+.attachment-image {
+  background: rgba(255, 255, 255, 0.04);
+  object-fit: cover;
+}
+
+.attachment-fallback {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.04);
+  color: #c7d3de;
+  display: flex;
+  justify-content: center;
+  padding: 16px;
+}
+
+.attachment-meta-row {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 10px 12px 12px;
+}
+
+.attachment-meta {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.attachment-meta strong,
+.attachment-meta span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-meta span {
+  color: #93a4b7;
+  font-size: 0.84rem;
+}
+
+.attachment-remove-button {
+  background: rgba(255, 255, 255, 0.08);
+  border: 0;
+  border-radius: 10px;
+  color: #f7fbff;
+  height: 32px;
+  width: 32px;
+}
+
 .markdown-body {
   color: inherit;
 }
@@ -560,10 +632,19 @@ code {
   padding-top: 16px;
 }
 
+.composer-file-input {
+  display: none;
+}
+
 .composer-card {
   margin: 0 auto;
   max-width: 980px;
   padding: 16px;
+}
+
+.composer-error {
+  color: #ffb4b4;
+  margin-bottom: 10px;
 }
 
 .composer-textarea {

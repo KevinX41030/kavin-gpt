@@ -1,4 +1,9 @@
-import type { ChatMessage, Conversation, ProviderInfo } from './types';
+import type {
+  ChatAttachment,
+  ChatMessage,
+  Conversation,
+  ProviderInfo,
+} from './types';
 
 export const STORAGE_KEY = 'kavin-gpt.conversations';
 
@@ -50,6 +55,40 @@ export const getProviderByKey = (
   key: string,
 ) => providers.find((provider) => provider.key === key);
 
+const inferImageConversationTitle = (attachments: ChatAttachment[]) => {
+  if (!attachments.length) {
+    return '新对话';
+  }
+
+  return attachments.length === 1 ? '发送了 1 张图片' : `发送了 ${attachments.length} 张图片`;
+};
+
+const normalizeAttachment = (value: unknown): ChatAttachment | null => {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const draft = value as Partial<ChatAttachment>;
+  const type = draft.type === 'image' ? draft.type : null;
+  const name = typeof draft.name === 'string' ? draft.name.trim() : '';
+  const mimeType = typeof draft.mimeType === 'string' ? draft.mimeType.trim() : '';
+  const size = typeof draft.size === 'number' && Number.isFinite(draft.size) ? draft.size : 0;
+  const dataUrl = typeof draft.dataUrl === 'string' && draft.dataUrl ? draft.dataUrl : undefined;
+
+  if (!type || !mimeType) {
+    return null;
+  }
+
+  return {
+    id: typeof draft.id === 'string' && draft.id ? draft.id : createId(),
+    type,
+    name: name || 'image',
+    mimeType,
+    size,
+    dataUrl,
+  };
+};
+
 const getDefaultProvider = (providers: ProviderInfo[]) =>
   providers.find((provider) => provider.configured) ?? providers[0];
 
@@ -61,8 +100,13 @@ const normalizeMessage = (value: unknown): ChatMessage | null => {
   const draft = value as Partial<ChatMessage>;
   const role = draft.role === 'assistant' || draft.role === 'user' ? draft.role : null;
   const content = typeof draft.content === 'string' ? draft.content.trim() : '';
+  const attachments = Array.isArray(draft.attachments)
+    ? draft.attachments
+        .map((attachment) => normalizeAttachment(attachment))
+        .filter((attachment): attachment is ChatAttachment => Boolean(attachment))
+    : [];
 
-  if (!role || !content) {
+  if (!role || (!content && !attachments.length)) {
     return null;
   }
 
@@ -70,6 +114,7 @@ const normalizeMessage = (value: unknown): ChatMessage | null => {
     id: typeof draft.id === 'string' && draft.id ? draft.id : createId(),
     role,
     content,
+    attachments,
     createdAt:
       typeof draft.createdAt === 'string' && draft.createdAt ? draft.createdAt : now(),
     error: Boolean(draft.error),
@@ -125,6 +170,10 @@ const normalizeConversation = (
     getDefaultProvider(providers);
   const inferredTitle =
     messages.find((message) => message.role === 'user')?.content ?? '新对话';
+  const firstUserMessage = messages.find((message) => message.role === 'user');
+  const inferredAttachmentTitle = firstUserMessage?.attachments?.length
+    ? inferImageConversationTitle(firstUserMessage.attachments)
+    : '新对话';
 
   return createConversation(providers, {
     ...draft,
@@ -132,7 +181,7 @@ const normalizeConversation = (
     title:
       typeof draft.title === 'string' && draft.title.trim()
         ? draft.title
-        : truncateTitle(inferredTitle),
+        : truncateTitle(inferredTitle || inferredAttachmentTitle),
     provider: fallbackProvider?.key ?? '',
     model:
       typeof draft.model === 'string' && draft.model.trim()
@@ -180,6 +229,31 @@ export const loadStoredConversations = () => {
 };
 
 export const saveStoredConversations = (items: Conversation[]) => {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+  } catch {
+    const sanitizedItems = items.map((conversation) => ({
+      ...conversation,
+      messages: conversation.messages.map((message) => ({
+        ...message,
+        content:
+          message.content || (message.attachments?.length ? '🖼️ 已发送图片' : message.content),
+        attachments: [],
+      })),
+    }));
+
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(sanitizedItems));
+    } catch {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+  }
 };
 
+export const deriveConversationTitle = (message: Pick<ChatMessage, 'content' | 'attachments'>) => {
+  if (message.content.trim()) {
+    return truncateTitle(message.content);
+  }
+
+  return inferImageConversationTitle(message.attachments ?? []);
+};

@@ -1,9 +1,21 @@
 export type MessageRole = 'user' | 'assistant';
 
+export interface ChatImageAttachment {
+  id: string;
+  type: 'image';
+  name: string;
+  mimeType: string;
+  size: number;
+  dataUrl?: string;
+}
+
+export type ChatAttachment = ChatImageAttachment;
+
 export interface ChatMessage {
   id: string;
   role: MessageRole;
   content: string;
+  attachments?: ChatAttachment[];
   createdAt: string;
   error?: boolean;
   provider?: string;
@@ -31,4 +43,3 @@ export interface Conversation {
   createdAt: string;
   updatedAt: string;
 }
-
